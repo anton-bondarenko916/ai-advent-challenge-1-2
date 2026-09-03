@@ -1,265 +1,150 @@
-"""Консольный решатель логических, алгоритмических и аналитических задач."""
+"""Интерактивное сравнение ответов DeepSeek при разных температурах."""
 
-import argparse
-import json
 import os
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 
+from colorama import Fore, init
 from openai import APIConnectionError, APIStatusError, OpenAI, OpenAIError
 from tabulate import tabulate
 
+
 MODEL_NAME = "deepseek-v4-pro"
-BASE_URL = "https://api.deepseek.com"
-METHODS = {
-    "способ1": "1. Прямой ответ",
-    "способ2": "2. Пошаговое решение",
-    "способ3": "3. Создание и использование промпта",
-    "способ4": "4. Группа экспертов",
-}
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+SYSTEM_PROMPT = "Ты - полезный помощник. Отвечай на русском языке."
+
+
+@dataclass(frozen=True)
+class TemperatureSetting:
+    """Настройки одного запуска запроса."""
+
+    value: float
+    color_name: str
+    color: str
 
 
 @dataclass
-class Result:
-    """Ответ одного способа и его измеримые показатели."""
+class QueryResult:
+    """Ответ API и метрики его получения."""
 
+    temperature: float
     answer: str
-    tokens: int
-    elapsed: float
-    score: float = 0.0
-    comment: str = "Оценка ещё не выполнена."
+    elapsed_seconds: float
+    total_tokens: int
 
 
-class TaskSolver:
-    """Организует запросы к DeepSeek и хранит состояние приложения."""
+SETTINGS = (
+    TemperatureSetting(0.0, "Синий", Fore.BLUE),
+    TemperatureSetting(0.7, "Зеленый", Fore.GREEN),
+    TemperatureSetting(1.2, "Красный", Fore.RED),
+)
 
-    def __init__(self, task_path: str | None = None) -> None:
-        self.task_text = ""
-        self.task_path: Path | None = None
-        self.selected = set(METHODS)
-        self.results: dict[str, Result] = {}
-        self.client: OpenAI | None = None
-        if task_path:
-            self.load_task(task_path)
 
-    def load_task(self, file_name: str) -> bool:
-        """Загружает задачу из UTF-8 файла после проверки пути."""
-        path = Path(file_name).expanduser()
-        if not path.is_file():
-            print("Ошибка: файл не существует или не является обычным файлом.")
-            return False
-        try:
-            text = path.read_text(encoding="utf-8").strip()
-        except UnicodeDecodeError:
-            print("Ошибка: файл должен быть сохранён в кодировке UTF-8.")
-            return False
-        except OSError as error:
-            print(f"Ошибка чтения файла: {error}")
-            return False
-        if not text:
-            print("Ошибка: файл с задачей пуст.")
-            return False
-        self.task_text, self.task_path = text, path
-        self.results.clear()
-        print(f"Задача загружена: {path}")
-        return True
-
-    def get_client(self) -> OpenAI | None:
-        """Создаёт API-клиент только перед фактическим обращением к сети."""
-        if self.client:
-            return self.client
-        api_key = os.getenv("DEEPSEEK_API_KEY")
-        if not api_key:
-            print("Ошибка: не найдена переменная окружения DEEPSEEK_API_KEY.")
-            print("Укажите API-ключ DeepSeek и повторите запуск решения.")
-            return None
-        self.client = OpenAI(api_key=api_key, base_url=BASE_URL)
-        return self.client
-
-    @staticmethod
-    def response_text(response: Any) -> str:
-        """Безопасно извлекает итоговый текст Chat Completions."""
-        if not response.choices:
-            return "DeepSeek не вернул вариантов ответа."
-        content = response.choices[0].message.content
-        return content.strip() if isinstance(content, str) and content.strip() else "DeepSeek не вернул текст ответа."
-
-    def request(self, system: str, user: str) -> tuple[str, int, float]:
-        """Выполняет запрос и возвращает текст, токены и затраченное время."""
-        client = self.get_client()
-        if client is None:
-            raise RuntimeError("API-ключ DeepSeek не настроен.")
-        started = time.perf_counter()
-        try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                extra_body={"thinking": {"type": "disabled"}},
-            )
-        except APIConnectionError as error:
-            raise RuntimeError("Не удалось подключиться к DeepSeek API.") from error
-        except APIStatusError as error:
-            raise RuntimeError(f"Ошибка DeepSeek API (код {error.status_code}): {error.message}") from error
-        except OpenAIError as error:
-            raise RuntimeError(f"Ошибка при обращении к DeepSeek API: {error}") from error
-        usage = getattr(response, "usage", None)
-        return self.response_text(response), int(getattr(usage, "total_tokens", 0) or 0), time.perf_counter() - started
-
-    def solve_method(self, method: str) -> Result:
-        """Запускает последовательность запросов, предусмотренную способом."""
-        if method == "способ1":
-            answer, tokens, elapsed = self.request(
-                "Ты - помощник, решающий логические, алгоритмические и аналитические задачи. Ответь на русском языке.", self.task_text)
-        elif method == "способ2":
-            answer, tokens, elapsed = self.request(
-                "Ты - помощник, решающий задачи. Решай задачу пошагово, объясняя каждый шаг. Ответь на русском языке. Решай пошагово.", self.task_text)
-        elif method == "способ3":
-            prompt, first_tokens, first_elapsed = self.request(
-                "Ты - эксперт по созданию эффективных промптов. Создай детальный промпт для решения следующей задачи. Промпт должен быть четким и структурированным. Ответь на русском языке.", self.task_text)
-            # Промпт нужен только для второго запроса и не показывается пользователю.
-            answer, second_tokens, second_elapsed = self.request(prompt, self.task_text)
-            tokens, elapsed = first_tokens + second_tokens, first_elapsed + second_elapsed
-        elif method == "способ4":
-            answer, tokens, elapsed = self.request(
-                "Ты - группа из 4 экспертов: Аналитик, Инженер, Инженер-2 и Скептик. Каждый эксперт должен дать свое решение задачи. Эксперты не должны видеть ответы друг друга. Ответ представь в формате: [Аналитик]: ... [Инженер]: ... [Инженер-2]: ... [Скептик]: ... Ответь на русском языке.", self.task_text)
-        else:
-            raise ValueError(f"Неизвестный способ: {method}")
-        return Result(answer, tokens, elapsed)
-
-    def run_solutions(self) -> None:
-        """Решает задачу выбранными способами, затем запускает оценку."""
-        if not self.task_text:
-            print("Сначала загрузите файл с задачей.")
-            return
-        if not self.selected:
-            print("Предупреждение: не выбран ни один способ решения.")
-            return
-        if not self.get_client():
-            return
-        self.results.clear()
-        for method in METHODS:
-            if method not in self.selected:
-                continue
-            print(f"\nВыполняется: {METHODS[method]}...")
-            try:
-                result = self.solve_method(method)
-            except RuntimeError as error:
-                print(f"Не удалось выполнить {METHODS[method]}: {error}")
-                continue
-            self.results[method] = result
-            print(f"=== {METHODS[method]} ===\n{result.answer}")
-        if self.results:
-            self.evaluate_results()
-
-    @staticmethod
-    def parse_json(text: str) -> dict[str, Any] | None:
-        """Читает JSON даже если модель поместила его в Markdown-блок."""
-        cleaned = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        candidates = [cleaned]
-        start, end = cleaned.find("{"), cleaned.rfind("}")
-        if start >= 0 and end > start:
-            candidates.append(cleaned[start:end + 1])
-        for candidate in candidates:
-            try:
-                parsed = json.loads(candidate)
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                continue
+def create_client() -> OpenAI | None:
+    """Создаёт клиент, если ключ DeepSeek указан в окружении."""
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        print("Ошибка: переменная окружения DEEPSEEK_API_KEY не найдена.")
+        print("Укажите API-ключ DeepSeek и запустите программу снова.")
         return None
+    return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
 
-    def evaluate_results(self) -> None:
-        """Просит нейросеть оценить все полученные ответы по шкале от 1 до 10."""
-        answers = "\n\n".join(f"{key} ({METHODS[key]}):\n{item.answer}" for key, item in self.results.items())
-        shape = ",\n  ".join(f'"{key}": {{"оценка": 8, "комментарий": "..."}}' for key in self.results)
-        system = (
-            "Ты - объективный оценщик решений. Оцени каждый представленный ответ по 10-балльной шкале "
-            "по правильности, полноте, логичности и обоснованности. Верни только валидный JSON без Markdown:\n{\n  "
-            + shape + "\n}"
+
+def get_answer(client: OpenAI, user_query: str, temperature: float) -> QueryResult:
+    """Отправляет один запрос и возвращает текст, время и число токенов."""
+    started_at = time.perf_counter()
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_query},
+            ],
+            temperature=temperature,
+            max_tokens=1000,
         )
+    except APIConnectionError as error:
+        raise RuntimeError("Ошибка сети: не удалось подключиться к DeepSeek API.") from error
+    except APIStatusError as error:
+        detail = getattr(error, "message", str(error))
+        raise RuntimeError(f"Ошибка DeepSeek API (код {error.status_code}): {detail}") from error
+    except OpenAIError as error:
+        raise RuntimeError(f"Ошибка при обращении к DeepSeek API: {error}") from error
+
+    elapsed = time.perf_counter() - started_at
+    choices = getattr(response, "choices", [])
+    content = choices[0].message.content if choices else None
+    answer = content.strip() if isinstance(content, str) and content.strip() else "DeepSeek не вернул текст ответа."
+    usage = getattr(response, "usage", None)
+    tokens = int(getattr(usage, "total_tokens", 0) or 0)
+    return QueryResult(temperature, answer, elapsed, tokens)
+
+
+def print_answer(result: QueryResult, setting: TemperatureSetting) -> None:
+    """Печатает ответ; цвет применяется только к его содержимому."""
+    print(f"\n--- Ответ при temperature={setting.value:.1f} ({setting.color_name}) ---")
+    print(f"{setting.color}{result.answer}{Fore.RESET}")
+    print("--- Конец ответа ---")
+
+
+def print_comparison(results: list[QueryResult]) -> None:
+    """Выводит сводную таблицу метрик с выравниванием колонок."""
+    rows = [[f"{item.temperature:.1f}", f"{item.elapsed_seconds:.2f}", item.total_tokens] for item in results]
+    print("\n=== СРАВНЕНИЕ ОТВЕТОВ ===")
+    try:
+        print(tabulate(rows, headers=["Температура", "Время (сек)", "Токены"], tablefmt="grid"))
+    except (TypeError, ValueError) as error:
+        print(f"Не удалось отформатировать таблицу: {error}")
+
+
+def compare_temperatures(client: OpenAI, user_query: str) -> None:
+    """Последовательно получает и отображает три ответа DeepSeek."""
+    print("\nВыполняю запросы с разной температурой...")
+    results: list[QueryResult] = []
+    for setting in SETTINGS:
         try:
-            answer, _, _ = self.request(system, f"Задача:\n{self.task_text}\n\nОтветы:\n{answers}")
+            result = get_answer(client, user_query, setting.value)
         except RuntimeError as error:
-            print(f"Не удалось оценить точность: {error}")
-            return
-        scores = self.parse_json(answer)
-        if scores is None:
-            print("Предупреждение: оценка вернула некорректный JSON; использованы нули.")
-            return
-        for key, result in self.results.items():
-            data = scores.get(key, {})
-            if not isinstance(data, dict):
+            print(f"\nНе удалось получить ответ при temperature={setting.value:.1f}: {error}")
+            continue
+        results.append(result)
+        print_answer(result, setting)
+
+    if results:
+        print_comparison(results)
+    else:
+        print("\nНе удалось получить ни одного ответа. Проверьте ключ, сеть и лимиты API.")
+
+
+def run_menu(client: OpenAI) -> None:
+    """Запускает главное меню до тех пор, пока пользователь не выберет выход."""
+    print("=== Сравнение температур DeepSeek ===")
+    print("Добро пожаловать! Я сравню ответы нейросети при разных температурах.")
+    while True:
+        print("\nГлавное меню:")
+        print("1. Ввести запрос")
+        print("2. Выход")
+        choice = input("Выберите действие: ").strip()
+
+        if choice == "1":
+            user_query = input("Введите ваш запрос к нейросети: ").strip()
+            if not user_query:
+                print("Ошибка: запрос не должен быть пустым.")
                 continue
-            try:
-                result.score = max(0.0, min(10.0, float(data.get("оценка", 0))))
-            except (TypeError, ValueError):
-                result.score = 0.0
-            result.comment = str(data.get("комментарий", "Нет комментария."))
-
-    def compare_results(self) -> None:
-        """Печатает таблицу метрик и лучший способ по оценке нейросети."""
-        if not self.results:
-            print("Нет результатов для сравнения. Сначала запустите решение.")
+            compare_temperatures(client, user_query)
+        elif choice == "2":
+            print("До свидания!")
             return
-        rows = [[METHODS[key], item.tokens, f"{item.elapsed:.2f}с", f"{item.score:.1f}"] for key, item in self.results.items()]
-        print("\n=== СРАВНЕНИЕ СПОСОБОВ РЕШЕНИЯ ===")
-        print(tabulate(rows, headers=["Способ", "Токены", "Время", "Оценка точности"], tablefmt="grid"))
-        best_key, best = max(self.results.items(), key=lambda pair: pair[1].score)
-        print(f"Лучший способ: {METHODS[best_key]} (оценка: {best.score:.1f})")
-        for key, item in self.results.items():
-            print(f"{METHODS[key]} — комментарий оценщика: {item.comment}")
-
-    def choose_methods(self) -> None:
-        """Включает или отключает способы, пока пользователь не подтвердит выбор."""
-        while True:
-            print("\nВыберите способы решения (введите номер для переключения):")
-            for number, key in enumerate(METHODS, 1):
-                print(f"[{'✓' if key in self.selected else ' '}] {number}. {METHODS[key][3:]}")
-            print("0. Готово")
-            choice = input("Ваш выбор: ").strip()
-            if choice == "0":
-                return
-            if choice in {"1", "2", "3", "4"}:
-                key = list(METHODS)[int(choice) - 1]
-                self.selected.symmetric_difference_update({key})
-            else:
-                print("Ошибка: введите номер от 0 до 4.")
-
-    def menu(self) -> None:
-        """Запускает главный цикл, который завершается только пунктом «Выход»."""
-        print("=== Решатель задач с ИИ ===")
-        print("Привет! Я помогу решить логические, алгоритмические и аналитические задачи.")
-        while True:
-            current = str(self.task_path) if self.task_path else "не загружена"
-            status = "все активны" if len(self.selected) == 4 else f"активно: {len(self.selected)} из 4"
-            print(f"\nТекущая задача: {current}\n\nГлавное меню:")
-            print("1. Загрузить задачу из файла")
-            print(f"2. Выбрать способы решения ({status})")
-            print("3. Запустить решение\n4. Сравнить результаты\n5. Выход")
-            choice = input("Выберите действие: ").strip()
-            if choice == "1":
-                self.load_task(input("Путь к UTF-8 файлу с задачей: ").strip().strip('"'))
-            elif choice == "2":
-                self.choose_methods()
-            elif choice == "3":
-                self.run_solutions()
-            elif choice == "4":
-                self.compare_results()
-            elif choice == "5":
-                print("Спасибо за использование решателя. До свидания!")
-                return
-            else:
-                print("Ошибка: выберите пункт от 1 до 5.")
+        else:
+            print("Ошибка: выберите пункт 1 или 2.")
 
 
 def main() -> None:
-    """Принимает необязательный путь к файлу в командной строке и запускает меню."""
-    parser = argparse.ArgumentParser(description="Решатель задач с помощью DeepSeek API")
-    parser.add_argument("task_file", nargs="?", help="путь к UTF-8 файлу с задачей")
-    args = parser.parse_args()
-    TaskSolver(args.task_file).menu()
+    """Проверяет окружение и запускает интерактивное приложение."""
+    init(autoreset=True)
+    client = create_client()
+    if client is not None:
+        run_menu(client)
 
 
 if __name__ == "__main__":
